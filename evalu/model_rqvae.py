@@ -1,15 +1,8 @@
 """
-RQ-VAE (Residual Quantized Variational AutoEncoder) 框架
-
 选手可参考以下流程，使用提供的 RQ-VAE 框架代码将多模态emb数据转换为Semantic Id:
 1. 使用 MmEmbDataset 读取不同特征 ID 的多模态emb数据.
 2. 训练 RQ-VAE 模型, 训练完成后将数据转换为Semantic Id.
 3. 参照 Item Sparse 特征格式处理Semantic Id，作为新特征加入Baseline模型训练.
-
-RQ-VAE是一种将连续向量量化为离散ID的方法，主要用于：
-- 将高维多模态特征（如图像、文本embedding）压缩为低维离散表示
-- 通过残差量化实现更精确的向量重建
-- 生成语义ID，便于在推荐模型中作为稀疏特征使用
 """
 
 import torch
@@ -18,125 +11,78 @@ from sklearn.cluster import KMeans
 
 # class MmEmbDataset(torch.utils.data.Dataset):
 #     """
-#     构建RQ-VAE训练的数据集
-#
+#     Build Dataset for RQ-VAE Training
+
 #     Args:
 #         data_dir = os.environ.get('TRAIN_DATA_PATH')
 #         feature_id = MM emb ID
 #     """
-#
+
 #     def __init__(self, data_dir, feature_id):
 #         super().__init__()
 #         self.data_dir = Path(data_dir)
 #         self.mm_emb_id = [feature_id]
 #         self.mm_emb_dict = load_mm_emb(Path(data_dir, "creative_emb"), self.mm_emb_id)
-#
+
 #         self.mm_emb = self.mm_emb_dict[self.mm_emb_id[0]]
 #         self.tid_list, self.emb_list = list(self.mm_emb.keys()), list(self.mm_emb.values())
 #         self.emb_list = [torch.tensor(emb, dtype=torch.float32) for emb in self.emb_list]
-#
+
 #         assert len(self.tid_list) == len(self.emb_list)
 #         self.item_cnt = len(self.tid_list)
-#
+
 #     def __getitem__(self, index):
 #         tid = torch.tensor(self.tid_list[index], dtype=torch.long)
 #         emb = self.emb_list[index]
 #         return tid, emb
-#
+
 #     def __len__(self):
 #         return self.item_cnt
-#
+
 #     @staticmethod
 #     def collate_fn(batch):
 #         tid, emb = zip(*batch)
-#
+
 #         tid_batch, emb_batch = torch.stack(tid, dim=0), torch.stack(emb, dim=0)
 #         return tid_batch, emb_batch
 
 
-## K-means聚类算法
+## Kmeans
 def kmeans(data, n_clusters, kmeans_iters):
     """
-    使用K-means算法进行聚类，用于初始化codebook
-    
-    Args:
-        data: 输入数据，形状为 [num_samples, embedding_dim]
-        n_clusters: 聚类中心数量
-        kmeans_iters: K-means最大迭代次数
-        
-    Returns:
-        tuple: (聚类中心张量, 聚类标签张量)
-        
-    Note:
-        auto init: n_init = 10 if n_clusters <= 10 else 1
+    auto init: n_init = 10 if n_clusters <= 10 else 1
     """
     km = KMeans(n_clusters=n_clusters, max_iter=kmeans_iters, n_init="auto")
 
-    # sklearn只支持CPU计算，需要转换为numpy
+    # sklearn only support cpu
     data_cpu = data.detach().cpu()
     np_data = data_cpu.numpy()
     km.fit(np_data)
-    
-    # 返回聚类中心和标签
     return torch.tensor(km.cluster_centers_), torch.tensor(km.labels_)
 
 
-## 平衡K-means算法
+## Balanced Kmeans
 class BalancedKmeans(torch.nn.Module):
-    """
-    平衡K-means算法实现
-    
-    与标准K-means不同，确保每个聚类中心分配到相似数量的样本，
-    避免某些聚类中心分配过多或过少的样本
-    
-    Args:
-        num_clusters: 聚类中心数量
-        kmeans_iters: 最大迭代次数
-        tolerance: 收敛容忍度
-        device: 计算设备
-    """
     def __init__(self, num_clusters: int, kmeans_iters: int, tolerance: float, device: str):
         super().__init__()
         self.num_clusters = num_clusters
         self.kmeans_iters = kmeans_iters
         self.tolerance = tolerance
         self.device = device
-        self._codebook = None  # 聚类中心（codebook）
+        self._codebook = None
 
     def _compute_distances(self, data):
-        """
-        计算数据点到所有聚类中心的距离
-        
-        Args:
-            data: 输入数据
-            
-        Returns:
-            torch.Tensor: 距离矩阵，形状为 [num_samples, num_clusters]
-        """
         return torch.cdist(data, self._codebook)
 
     def _assign_clusters(self, dist):
-        """
-        平衡地分配样本到聚类中心
-        
-        确保每个聚类中心分配到大致相等数量的样本
-        
-        Args:
-            dist: 距离矩阵
-            
-        Returns:
-            torch.Tensor: 聚类标签
-        """
         samples_cnt = dist.shape[0]
         samples_labels = torch.zeros(samples_cnt, dtype=torch.long, device=self.device)
         clusters_cnt = torch.zeros(self.num_clusters, dtype=torch.long, device=self.device)
 
-        # 按距离排序，优先分配给最近的可用聚类中心
         sorted_indices = torch.argsort(dist, dim=-1)
         for i in range(samples_cnt):
             for j in range(self.num_clusters):
                 cluster_idx = sorted_indices[i, j]
-                # 如果当前聚类中心的样本数量还未达到平均值，则分配给它
                 if clusters_cnt[cluster_idx] < samples_cnt // self.num_clusters:
                     samples_labels[i] = cluster_idx
                     clusters_cnt[cluster_idx] += 1
@@ -145,51 +91,27 @@ class BalancedKmeans(torch.nn.Module):
         return samples_labels
 
     def _update_codebook(self, data, samples_labels):
-        """
-        更新聚类中心
-        
-        Args:
-            data: 输入数据
-            samples_labels: 聚类标签
-            
-        Returns:
-            torch.Tensor: 更新后的聚类中心
-        """
         _new_codebook = []
         for i in range(self.num_clusters):
             cluster_data = data[samples_labels == i]
             if len(cluster_data) > 0:
-                # 计算属于该聚类的样本的均值作为新的聚类中心
                 _new_codebook.append(cluster_data.mean(dim=0))
             else:
-                # 如果没有样本分配给该聚类，保持原来的聚类中心
                 _new_codebook.append(self._codebook[i])
         return torch.stack(_new_codebook)
 
     def fit(self, data):
-        """
-        训练平衡K-means模型
-        
-        Args:
-            data: 训练数据
-            
-        Returns:
-            tuple: (最终的聚类中心, 最终的聚类标签)
-        """
         num_emb, codebook_emb_dim = data.shape
         data = data.to(self.device)
 
-        # 初始化聚类中心：随机选择样本作为初始中心
+        # initialize codebook
         indices = torch.randperm(num_emb)[: self.num_clusters]
         self._codebook = data[indices].clone()
 
-        # 迭代更新聚类中心
         for _ in range(self.kmeans_iters):
             dist = self._compute_distances(data)
             samples_labels = self._assign_clusters(dist)
             _new_codebook = self._update_codebook(data, samples_labels)
-            
-            # 检查收敛性
             if torch.norm(_new_codebook - self._codebook) < self.tolerance:
                 break
 
@@ -198,124 +120,55 @@ class BalancedKmeans(torch.nn.Module):
         return self._codebook, samples_labels
 
     def predict(self, data):
-        """
-        对新数据进行聚类预测
-        
-        Args:
-            data: 输入数据
-            
-        Returns:
-            torch.Tensor: 聚类标签
-        """
         data = data.to(self.device)
         dist = self._compute_distances(data)
         samples_labels = self._assign_clusters(dist)
         return samples_labels
 
 
-## RQ-VAE编码器
+## Base RQVAE
 class RQEncoder(torch.nn.Module):
-    """
-    RQ-VAE的编码器部分
-    
-    将输入的高维向量编码为潜在空间的表示
-    使用多层全连接网络+ReLU激活函数
-    
-    Args:
-        input_dim: 输入维度
-        hidden_channels: 隐藏层维度列表
-        latent_dim: 潜在空间维度
-    """
     def __init__(self, input_dim: int, hidden_channels: list, latent_dim: int):
         super().__init__()
 
         self.stages = torch.nn.ModuleList()
         in_dim = input_dim
 
-        # 构建隐藏层
         for out_dim in hidden_channels:
             stage = torch.nn.Sequential(torch.nn.Linear(in_dim, out_dim), torch.nn.ReLU())
             self.stages.append(stage)
             in_dim = out_dim
 
-        # 最后一层映射到潜在空间
         self.stages.append(torch.nn.Sequential(torch.nn.Linear(in_dim, latent_dim), torch.nn.ReLU()))
 
     def forward(self, x):
-        """
-        前向传播
-        
-        Args:
-            x: 输入张量，形状为 [batch_size, input_dim]
-            
-        Returns:
-            torch.Tensor: 编码后的潜在表示，形状为 [batch_size, latent_dim]
-        """
         for stage in self.stages:
             x = stage(x)
         return x
 
 
 class RQDecoder(torch.nn.Module):
-    """
-    RQ-VAE的解码器部分
-    
-    将潜在空间的表示解码回原始维度
-    网络结构与编码器对称
-    
-    Args:
-        latent_dim: 潜在空间维度
-        hidden_channels: 隐藏层维度列表（与编码器相反的顺序）
-        output_dim: 输出维度
-    """
     def __init__(self, latent_dim: int, hidden_channels: list, output_dim: int):
         super().__init__()
 
         self.stages = torch.nn.ModuleList()
         in_dim = latent_dim
 
-        # 构建隐藏层
         for out_dim in hidden_channels:
             stage = torch.nn.Sequential(torch.nn.Linear(in_dim, out_dim), torch.nn.ReLU())
             self.stages.append(stage)
             in_dim = out_dim
 
-        # 最后一层映射到输出维度
         self.stages.append(torch.nn.Sequential(torch.nn.Linear(in_dim, output_dim), torch.nn.ReLU()))
 
     def forward(self, x):
-        """
-        前向传播
-        
-        Args:
-            x: 潜在表示张量，形状为 [batch_size, latent_dim]
-            
-        Returns:
-            torch.Tensor: 重建的输出，形状为 [batch_size, output_dim]
-        """
         for stage in self.stages:
             x = stage(x)
         return x
 
 
-## 向量量化Embedding层
+## Generate semantic id
 class VQEmbedding(torch.nn.Embedding):
-    """
-    向量量化Embedding层
-    
-    将连续向量量化为离散的语义ID，核心思想是：
-    1. 建立codebook（离散向量表）
-    2. 将输入向量映射到最近的codebook向量
-    3. 返回对应的语义ID
-    
-    Args:
-        num_clusters: codebook大小（离散向量数量）
-        codebook_emb_dim: codebook向量维度
-        kmeans_method: 初始化codebook的方法（'kmeans'或'bkmeans'）
-        kmeans_iters: K-means迭代次数
-        distances_method: 距离计算方法（'cosine'或'l2'）
-        device: 计算设备
-    """
     def __init__(
         self,
         num_clusters,
@@ -335,53 +188,31 @@ class VQEmbedding(torch.nn.Embedding):
         self.device = device
 
     def _create_codebook(self, data):
-        """
-        创建并初始化codebook
-        
-        Args:
-            data: 训练数据，用于初始化codebook
-        """
         if self.kmeans_method == 'kmeans':
-            # 使用标准K-means初始化
             _codebook, _ = kmeans(data, self.num_clusters, self.kmeans_iters)
         elif self.kmeans_method == 'bkmeans':
-            # 使用平衡K-means初始化
             BKmeans = BalancedKmeans(
                 num_clusters=self.num_clusters, kmeans_iters=self.kmeans_iters, tolerance=1e-4, device=self.device
             )
             _codebook, _ = BKmeans.fit(data)
         else:
-            # 随机初始化
             _codebook = torch.randn(self.num_clusters, self.codebook_emb_dim)
-            
         _codebook = _codebook.to(self.device)
         assert _codebook.shape == (self.num_clusters, self.codebook_emb_dim)
-        
-        # 将codebook设置为可学习参数
         self.codebook = torch.nn.Parameter(_codebook)
 
     @torch.no_grad()
     def _compute_distances(self, data):
-        """
-        计算输入数据到codebook中每个向量的距离
-        
-        Args:
-            data: 输入数据
-            
-        Returns:
-            torch.Tensor: 距离矩阵
-        """
-        _codebook_t = self.codebook.t()  # 转置codebook
+        _codebook_t = self.codebook.t()
         assert _codebook_t.shape == (self.codebook_emb_dim, self.num_clusters)
         assert data.shape[-1] == self.codebook_emb_dim
 
         if self.distances_method == 'cosine':
-            # 余弦距离
             data_norm = F.normalize(data, p=2, dim=-1)
             _codebook_t_norm = F.normalize(_codebook_t, p=2, dim=0)
             distances = 1 - torch.mm(data_norm, _codebook_t_norm)
+        # l2
         else:
-            # L2距离
             data_norm_sq = data.pow(2).sum(dim=-1, keepdim=True)
             _codebook_t_norm_sq = _codebook_t.pow(2).sum(dim=0, keepdim=True)
             distances = torch.addmm(data_norm_sq + _codebook_t_norm_sq, data, _codebook_t, beta=1.0, alpha=-2.0)
@@ -389,44 +220,15 @@ class VQEmbedding(torch.nn.Embedding):
 
     @torch.no_grad()
     def _create_semantic_id(self, data):
-        """
-        生成语义ID
-        
-        找到距离最近的codebook向量，返回其索引作为语义ID
-        
-        Args:
-            data: 输入数据
-            
-        Returns:
-            torch.Tensor: 语义ID
-        """
         distances = self._compute_distances(data)
         _semantic_id = torch.argmin(distances, dim=-1)
         return _semantic_id
 
     def _update_emb(self, _semantic_id):
-        """
-        根据语义ID获取对应的codebook向量
-        
-        Args:
-            _semantic_id: 语义ID
-            
-        Returns:
-            torch.Tensor: 对应的codebook向量
-        """
         update_emb = super().forward(_semantic_id)
         return update_emb
 
     def forward(self, data):
-        """
-        前向传播
-        
-        Args:
-            data: 输入数据
-            
-        Returns:
-            tuple: (量化后的向量, 语义ID)
-        """
         self._create_codebook(data)
         _semantic_id = self._create_semantic_id(data)
         update_emb = self._update_emb(_semantic_id)
@@ -434,28 +236,16 @@ class VQEmbedding(torch.nn.Embedding):
         return update_emb, _semantic_id
 
 
-## 残差量化器
+## Residual Quantizer
 class RQ(torch.nn.Module):
     """
-    残差量化器 (Residual Quantizer)
-    
-    残差量化的核心思想是使用多个codebook逐步量化残差：
-    1. 第一个codebook量化原始向量
-    2. 第二个codebook量化第一次的残差
-    3. 以此类推...
-    
-    这样可以获得更精确的向量重建，同时生成多级语义ID
-    
     Args:
-        num_codebooks: codebook数量
-        codebook_size: 每个codebook的大小列表
-        codebook_emb_dim: codebook向量维度
-        shared_codebook: 是否所有codebook共享同一个
-        kmeans_method: K-means方法
-        kmeans_iters: K-means迭代次数
-        distances_method: 距离计算方法
-        loss_beta: RQ-VAE损失函数的beta参数
-        device: 计算设备
+        num_codebooks, codebook_size, codebook_emb_dim -> Build codebook
+        if_shared_codebook -> If use same codebook
+        kmeans_method, kmeans_iters -> Initialize codebook
+        distances_method -> Generate semantic_id
+
+        loss_beta -> Calculate RQ-VAE loss
     """
 
     def __init__(
@@ -483,9 +273,7 @@ class RQ(torch.nn.Module):
         self.loss_beta = loss_beta
         self.device = device
 
-        # 创建多个VQ模块
         if self.shared_codebook:
-            # 所有codebook使用相同的大小
             self.vqmodules = torch.nn.ModuleList(
                 [
                     VQEmbedding(
@@ -501,7 +289,6 @@ class RQ(torch.nn.Module):
             )
 
         else:
-            # 每个codebook可以有不同的大小
             self.vqmodules = torch.nn.ModuleList(
                 [
                     VQEmbedding(
@@ -518,66 +305,41 @@ class RQ(torch.nn.Module):
 
     def quantize(self, data):
         """
-        执行残差量化过程
-        
-        残差量化过程示例：
-            第i次量化: input[i]( i.e. res[i-1] ) = VQ[i] + res[i]
-            vq_emb_list: [vq1, vq1+vq2, ...] (累积的量化结果)
-            res_emb_list: [res1, res2, ...] (每次的残差)
-            semantic_id_list: [vq1_sid, vq2_sid, ...] (每次的语义ID)
+        Exa:
+            i-th quantize: input[i]( i.e. res[i-1] ) = VQ[i] + res[i]
+            vq_emb_list: [vq1, vq1+vq2, ...]
+            res_emb_list: [res1, res2, ...]
+            semantic_id_list: [vq1_sid, vq2_sid, ...]
 
-        Args:
-            data: 输入数据
-            
         Returns:
-            tuple: (累积量化向量列表, 残差向量列表, 语义ID列表)
-                vq_emb_list[0] -> [batch_size, codebook_emb_dim]
-                semantic_id_list -> [batch_size, num_codebooks]
+            vq_emb_list[0] -> [batch_size, codebook_emb_dim]
+            semantic_id_list -> [batch_size, num_codebooks]
         """
-        res_emb = data.detach().clone()  # 初始残差等于输入数据
+        res_emb = data.detach().clone()
 
         vq_emb_list, res_emb_list = [], []
         semantic_id_list = []
-        vq_emb_aggre = torch.zeros_like(data)  # 累积的量化结果
+        vq_emb_aggre = torch.zeros_like(data)
 
-        # 逐个codebook进行残差量化
         for i in range(self.num_codebooks):
-            # 对当前残差进行量化
             vq_emb, _semantic_id = self.vqmodules[i](res_emb)
 
-            # 更新残差和累积结果
-            res_emb -= vq_emb      # 新的残差 = 旧残差 - 量化向量
-            vq_emb_aggre += vq_emb # 累积量化结果
+            res_emb -= vq_emb
+            vq_emb_aggre += vq_emb
 
-            # 保存中间结果
             res_emb_list.append(res_emb)
-            vq_emb_list.append(vq_emb_aggre.clone())
+            vq_emb_list.append(vq_emb_aggre)
             semantic_id_list.append(_semantic_id.unsqueeze(dim=-1))
 
-        # 将语义ID拼接成一个张量
         semantic_id_list = torch.cat(semantic_id_list, dim=-1)
         return vq_emb_list, res_emb_list, semantic_id_list
 
     def _rqvae_loss(self, vq_emb_list, res_emb_list):
-        """
-        计算RQ-VAE损失
-        
-        损失包含两部分：
-        1. commitment loss: 鼓励encoder输出接近量化向量
-        2. codebook loss: 更新codebook使其接近encoder输出
-        
-        Args:
-            vq_emb_list: 量化向量列表
-            res_emb_list: 残差向量列表
-            
-        Returns:
-            torch.Tensor: RQ-VAE损失
-        """
         rqvae_loss_list = []
         for idx, quant in enumerate(vq_emb_list):
-            # 使用stop gradient技巧分别优化encoder和codebook
-            loss1 = (res_emb_list[idx].detach() - quant).pow(2.0).mean()  # codebook loss
-            loss2 = (res_emb_list[idx] - quant.detach()).pow(2.0).mean()  # commitment loss
+            # stop gradient
+            loss1 = (res_emb_list[idx].detach() - quant).pow(2.0).mean()
+            loss2 = (res_emb_list[idx] - quant.detach()).pow(2.0).mean()
             partial_loss = loss1 + self.loss_beta * loss2
             rqvae_loss_list.append(partial_loss)
 
@@ -585,15 +347,6 @@ class RQ(torch.nn.Module):
         return rqvae_loss
 
     def forward(self, data):
-        """
-        前向传播
-        
-        Args:
-            data: 输入数据
-            
-        Returns:
-            tuple: (量化向量列表, 语义ID列表, RQ-VAE损失)
-        """
         vq_emb_list, res_emb_list, semantic_id_list = self.quantize(data)
         rqvae_loss = self._rqvae_loss(vq_emb_list, res_emb_list)
 
@@ -601,28 +354,6 @@ class RQ(torch.nn.Module):
 
 
 class RQVAE(torch.nn.Module):
-    """
-    完整的RQ-VAE模型
-    
-    结合编码器、解码器和残差量化器，实现：
-    1. 将高维连续向量编码为潜在表示
-    2. 对潜在表示进行残差量化
-    3. 将量化后的表示解码回原始维度
-    4. 生成语义ID用于下游任务
-    
-    Args:
-        input_dim: 输入维度
-        hidden_channels: 编码器/解码器隐藏层维度
-        latent_dim: 潜在空间维度
-        num_codebooks: codebook数量
-        codebook_size: codebook大小列表
-        shared_codebook: 是否共享codebook
-        kmeans_method: K-means方法
-        kmeans_iters: K-means迭代次数
-        distances_method: 距离计算方法
-        loss_beta: 损失函数beta参数
-        device: 计算设备
-    """
     def __init__(
         self,
         input_dim: int,
@@ -638,14 +369,8 @@ class RQVAE(torch.nn.Module):
         device: str,
     ):
         super().__init__()
-        
-        # 编码器：输入 -> 潜在空间
         self.encoder = RQEncoder(input_dim, hidden_channels, latent_dim).to(device)
-        
-        # 解码器：潜在空间 -> 输出（维度反向）
         self.decoder = RQDecoder(latent_dim, hidden_channels[::-1], input_dim).to(device)
-        
-        # 残差量化器：潜在空间 -> 语义ID
         self.rq = RQ(
             num_codebooks,
             codebook_size,
@@ -659,81 +384,26 @@ class RQVAE(torch.nn.Module):
         ).to(device)
 
     def encode(self, x):
-        """
-        编码过程
-        
-        Args:
-            x: 输入数据
-            
-        Returns:
-            torch.Tensor: 潜在表示
-        """
         return self.encoder(x)
 
     def decode(self, z_vq):
-        """
-        解码过程
-        
-        Args:
-            z_vq: 量化后的潜在表示（可以是列表或张量）
-            
-        Returns:
-            torch.Tensor: 重建的输出
-        """
         if isinstance(z_vq, list):
-            z_vq = z_vq[-1]  # 使用最后一个（完整的）量化结果
+            z_vq = z_vq[-1]
         return self.decoder(z_vq)
 
     def compute_loss(self, x_hat, x_gt, rqvae_loss):
-        """
-        计算总损失
-        
-        Args:
-            x_hat: 重建的输出
-            x_gt: 真实的输入
-            rqvae_loss: RQ-VAE损失
-            
-        Returns:
-            tuple: (重建损失, RQ-VAE损失, 总损失)
-        """
-        recon_loss = F.mse_loss(x_hat, x_gt, reduction="mean")  # 重建损失
-        total_loss = recon_loss + rqvae_loss                    # 总损失
+        recon_loss = F.mse_loss(x_hat, x_gt, reduction="mean")
+        total_loss = recon_loss + rqvae_loss
         return recon_loss, rqvae_loss, total_loss
 
     def _get_codebook(self, x_gt):
-        """
-        获取语义ID（推理时使用）
-        
-        Args:
-            x_gt: 输入数据
-            
-        Returns:
-            torch.Tensor: 语义ID
-        """
         z_e = self.encode(x_gt)
         vq_emb_list, semantic_id_list, rqvae_loss = self.rq(z_e)
         return semantic_id_list
 
     def forward(self, x_gt):
-        """
-        完整的前向传播过程
-        
-        Args:
-            x_gt: 输入数据
-            
-        Returns:
-            tuple: (重建输出, 语义ID, 重建损失, RQ-VAE损失, 总损失)
-        """
-        # 编码
         z_e = self.encode(x_gt)
-        
-        # 残差量化
         vq_emb_list, semantic_id_list, rqvae_loss = self.rq(z_e)
-        
-        # 解码
         x_hat = self.decode(vq_emb_list)
-        
-        # 计算损失
         recon_loss, rqvae_loss, total_loss = self.compute_loss(x_hat, x_gt, rqvae_loss)
-        
         return x_hat, semantic_id_list, recon_loss, rqvae_loss, total_loss
