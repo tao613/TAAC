@@ -177,6 +177,13 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
             for feat_id in missing_fields:
                 feature[feat_id] = feat_default_value[feat_id]
                 
+            # ==================== 添加时间特征默认值 ====================
+            # 候选物品没有时间戳，使用默认值
+            for feat_id in feat_types.get('time_sparse', []):
+                feature[feat_id] = feat_default_value[feat_id]
+            for feat_id in feat_types.get('time_continual', []):
+                feature[feat_id] = feat_default_value[feat_id]
+                
             # 添加多模态特征
             for feat_id in feat_types['item_emb']:
                 if creative_id in mm_emb_dict[feat_id]:
@@ -242,7 +249,16 @@ def infer():
 
     # 加载训练好的模型权重
     ckpt_path = get_ckpt_path()
-    model.load_state_dict(torch.load(ckpt_path, map_location=torch.device(args.device)))
+    checkpoint = torch.load(ckpt_path, map_location=torch.device(args.device))
+    
+    # 使用strict=False来处理模型结构不完全匹配的情况
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+    
+    if missing_keys:
+        print(f"Missing keys in checkpoint: {missing_keys}")
+    if unexpected_keys:
+        print(f"Unexpected keys in checkpoint: {unexpected_keys}")
+    
     print(f"Model loaded from: {ckpt_path}")
     
     # ==================== 生成用户Query Embedding ====================

@@ -2,7 +2,6 @@ import json
 import pickle
 import struct
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import torch
@@ -212,11 +211,6 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['item_emb'] = self.mm_emb_ids
         feat_types['user_continual'] = []
         feat_types['item_continual'] = []
-        
-        # ==================== 时间特征定义 ====================
-        # 时间特征：这些特征同时适用于用户和物品token
-        feat_types['time_sparse'] = ['time_of_day', 'day_of_week']           # 时间稀疏特征
-        feat_types['time_continual'] = ['time_delta']                        # 时间连续特征
 
         for feat_id in feat_types['user_sparse']:
             feat_default_value[feat_id] = 0
@@ -238,19 +232,6 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = np.zeros(
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
             )
-            
-        # ==================== 时间特征默认值和统计信息 ====================
-        # 时间稀疏特征
-        for feat_id in feat_types['time_sparse']:
-            feat_default_value[feat_id] = 0                                   # 时间稀疏特征默认值为0
-            if feat_id == 'time_of_day':
-                feat_statistics[feat_id] = 24                                 # 0-23小时，共24种取值
-            elif feat_id == 'day_of_week':
-                feat_statistics[feat_id] = 7                                  # 0-6天，共7种取值
-                
-        # 时间连续特征
-        for feat_id in feat_types['time_continual']:
-            feat_default_value[feat_id] = 0                                   # 时间连续特征默认值为0
 
         return feat_default_value, feat_types, feat_statistics
 
@@ -361,61 +342,26 @@ class MyTestDataset(MyDataset):
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
 
         ext_user_sequence = []
-        timestamps = []  # 收集时间戳用于计算时间间隔
-        
         for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, _, timestamp = record_tuple
-            
-            # ==================== 提取时间特征（测试数据集） ====================
-            time_features = {}
-            if timestamp:
-                # 将时间戳转换为datetime对象
-                dt = datetime.fromtimestamp(timestamp)
-                
-                # 提取时间特征
-                time_features['time_of_day'] = dt.hour          # 0-23，表示一天中的小时
-                time_features['day_of_week'] = dt.weekday()     # 0-6，表示一周中的天（0=周一）
-                
-                timestamps.append(timestamp)
-            else:
-                # 如果没有时间戳，使用默认值
-                time_features['time_of_day'] = 0
-                time_features['day_of_week'] = 0
-                timestamps.append(0)
-            
-            # ==================== 计算时间间隔特征 ====================
-            if len(timestamps) > 1 and timestamps[-1] > 0 and timestamps[-2] > 0:
-                # time_delta: 与上一个行为的时间间隔（秒）
-                time_features['time_delta'] = timestamps[-1] - timestamps[-2]
-            else:
-                time_features['time_delta'] = 0  # 第一个行为或无效时间戳的默认值
-            
-            # 处理用户信息
+            u, i, user_feat, item_feat, _, _ = record_tuple
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id
                     user_id = u
                 else:  # 如果是int，说明是re_id
                     user_id = self.indexer_u_rev[u]
-                    
-            # 添加用户token
             if u and user_feat:
                 if type(u) == str:
                     u = 0
                 if user_feat:
                     user_feat = self._process_cold_start_feat(user_feat)
-                    # 将时间特征添加到用户特征中
-                    user_feat.update(time_features)
                 ext_user_sequence.insert(0, (u, user_feat, 2))
 
-            # 添加物品token
             if i and item_feat:
                 # 序列对于训练时没见过的item，不会直接赋0，而是保留creative_id，creative_id远大于训练时的itemnum
                 if i > self.itemnum:
                     i = 0
                 if item_feat:
                     item_feat = self._process_cold_start_feat(item_feat)
-                    # 将时间特征添加到物品特征中
-                    item_feat.update(time_features)
                 ext_user_sequence.append((i, item_feat, 1))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)

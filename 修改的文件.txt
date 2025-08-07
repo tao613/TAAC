@@ -1,0 +1,3 @@
+训练：mian,model,dataset
+
+测试：infer,model,dataset
