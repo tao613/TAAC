@@ -197,13 +197,16 @@ class BaselineModel(torch.nn.Module):
         self._init_feat_info(feat_statistics, feat_types)
 
         # ==================== 特征融合层定义 ====================
-        # 计算用户和物品特征拼接后的维度
-        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
-            self.USER_CONTINUAL_FEAT
-        )
+        # 计算用户和物品特征拼接后的维度（包含时间特征）
+        userdim = args.hidden_units * (
+            len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + len(self.TIME_SPARSE_FEAT)
+        ) + len(self.USER_CONTINUAL_FEAT) + len(self.TIME_CONTINUAL_FEAT)
+        
         itemdim = (
-            args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
-            + len(self.ITEM_CONTINUAL_FEAT)
+            args.hidden_units * (
+                len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT) + len(self.TIME_SPARSE_FEAT)
+            )
+            + len(self.ITEM_CONTINUAL_FEAT) + len(self.TIME_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
@@ -246,6 +249,11 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
+        
+        # ==================== 初始化时间特征Embedding ====================
+        # 时间特征的embedding表
+        for k in self.TIME_SPARSE_FEAT:
+            self.sparse_emb[k] = torch.nn.Embedding(self.TIME_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -262,6 +270,11 @@ class BaselineModel(torch.nn.Module):
         self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']                               # 物品连续特征
         self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}     # 用户数组特征
         self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}     # 物品数组特征
+        
+        # ==================== 时间特征处理 ====================
+        # 时间特征同时适用于用户和物品token
+        self.TIME_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types.get('time_sparse', [])}     # 时间稀疏特征
+        self.TIME_CONTINUAL_FEAT = feat_types.get('time_continual', [])                               # 时间连续特征
         
         # 多模态特征的维度映射（81-86对应不同的多模态特征类型）
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
@@ -347,6 +360,8 @@ class BaselineModel(torch.nn.Module):
             (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),    # 物品稀疏特征
             (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),      # 物品数组特征
             (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list), # 物品连续特征
+            (self.TIME_SPARSE_FEAT, 'time_sparse', item_feat_list),    # 时间稀疏特征（应用于物品token）
+            (self.TIME_CONTINUAL_FEAT, 'time_continual', item_feat_list), # 时间连续特征（应用于物品token）
         ]
 
         # 如果需要处理用户特征，添加用户特征类型
@@ -356,6 +371,8 @@ class BaselineModel(torch.nn.Module):
                     (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),      # 用户稀疏特征
                     (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),        # 用户数组特征
                     (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list), # 用户连续特征
+                    (self.TIME_SPARSE_FEAT, 'time_sparse', user_feat_list),      # 时间稀疏特征（应用于用户token）
+                    (self.TIME_CONTINUAL_FEAT, 'time_continual', user_feat_list), # 时间连续特征（应用于用户token）
                 ]
             )
 

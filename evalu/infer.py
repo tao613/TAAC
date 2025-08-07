@@ -54,7 +54,8 @@ def get_args():
     parser.add_argument('--device', default='cuda', type=str, help='推理设备')
     parser.add_argument('--inference_only', action='store_true', help='仅推理模式')
     parser.add_argument('--state_dict_path', default=None, type=str, help='预训练模型权重路径')
-    parser.add_argument('--norm_first', action='store_true', help='是否在注意力层前先进行LayerNorm')
+    parser.add_argument('--norm_first', action='store_true', default=True, 
+                       help='是否在注意力层前先进行LayerNorm（Pre-LayerNorm结构，默认启用以提升训练稳定性）')
 
     # 多模态特征ID配置
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -12,6 +13,33 @@ from tqdm import tqdm
 
 from dataset import MyDataset
 from model import BaselineModel
+
+
+def get_warmup_cosine_lr(step, warmup_steps, total_steps, base_lr, min_lr_ratio=0.01):
+    """
+    计算Warmup + Cosine Annealing学习率调度
+    
+    Args:
+        step: 当前训练步数
+        warmup_steps: 预热步数
+        total_steps: 总训练步数
+        base_lr: 基础学习率
+        min_lr_ratio: 最小学习率与基础学习率的比例
+        
+    Returns:
+        lr: 当前步数对应的学习率
+    """
+    if step < warmup_steps:
+        # Warmup阶段：学习率从0线性增长到base_lr
+        lr = base_lr * step / warmup_steps
+    else:
+        # Cosine Annealing阶段：学习率按余弦函数衰减
+        cosine_steps = total_steps - warmup_steps
+        cosine_step = step - warmup_steps
+        min_lr = base_lr * min_lr_ratio
+        lr = min_lr + (base_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * cosine_step / cosine_steps))
+    
+    return lr
 
 
 def get_args():
@@ -38,7 +66,24 @@ def get_args():
     parser.add_argument('--device', default='cuda', type=str, help='训练设备')
     parser.add_argument('--inference_only', action='store_true', help='仅推理模式，不训练')
     parser.add_argument('--state_dict_path', default=None, type=str, help='预训练模型权重路径')
-    parser.add_argument('--norm_first', action='store_true', help='是否在注意力层前先进行LayerNorm')
+    parser.add_argument('--norm_first', action='store_true', default=True, 
+                       help='是否在注意力层前先进行LayerNorm（Pre-LayerNorm结构，默认启用以提升训练稳定性）')
+
+    # ==================== 学习率调度器配置 ====================
+    parser.add_argument('--use_lr_scheduler', action='store_true', default=True,
+                       help='是否使用学习率调度器（Warmup + Cosine Annealing，默认启用）')
+    parser.add_argument('--warmup_steps', default=100, type=int,
+                       help='学习率预热步数，在此期间学习率从0线性增长到设定值')
+    parser.add_argument('--min_lr_ratio', default=0.01, type=float,
+                       help='最小学习率与初始学习率的比例（用于Cosine Annealing）')
+
+    # ==================== 早停机制配置 ====================
+    parser.add_argument('--early_stopping', action='store_true', default=True,
+                       help='是否启用早停机制（默认启用，防止过拟合）')
+    parser.add_argument('--patience', default=5, type=int,
+                       help='早停耐心值：验证损失连续多少个epoch不改善后停止训练')
+    parser.add_argument('--min_delta', default=1e-4, type=float,
+                       help='最小改善阈值：验证损失改善小于此值时认为没有改善')
 
     # 多模态特征ID配置
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, 
@@ -126,6 +171,15 @@ if __name__ == '__main__':
     
     # 使用Adam优化器，beta参数调整为(0.9, 0.98)以提高训练稳定性
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    
+    # ==================== 学习率调度器初始化 ====================
+    if args.use_lr_scheduler:
+        # 计算总训练步数（用于Cosine Annealing）
+        total_steps = len(train_loader) * args.num_epochs
+        print(f"学习率调度器已启用: Warmup({args.warmup_steps} steps) + Cosine Annealing")
+        print(f"总训练步数: {total_steps}, 基础学习率: {args.lr}, 最小学习率比例: {args.min_lr_ratio}")
+    else:
+        print("使用固定学习率:", args.lr)
 
     # 记录最佳验证和测试指标
     best_val_ndcg, best_val_hr = 0.0, 0.0
@@ -134,10 +188,24 @@ if __name__ == '__main__':
     t0 = time.time()
     global_step = 0
     
+    # ==================== 早停机制变量初始化 ====================
+    if args.early_stopping:
+        best_val_loss = float('inf')        # 最佳验证损失
+        patience_counter = 0                # 当前耐心计数器
+        early_stop_flag = False             # 早停标志
+        print(f"早停机制已启用: patience={args.patience}, min_delta={args.min_delta}")
+    else:
+        print("早停机制已禁用")
+    
     print("Start training")
     
     # ==================== 主训练循环 ====================
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
+        # ==================== 早停检查 ====================
+        if args.early_stopping and 'early_stop_flag' in locals() and early_stop_flag:
+            print(f"早停标志已设置，跳过第 {epoch} 个epoch")
+            break
+            
         model.train()  # 设置为训练模式
         
         # 如果是仅推理模式，跳过训练
@@ -192,6 +260,18 @@ if __name__ == '__main__':
             # 反向传播和参数更新
             loss.backward()
             optimizer.step()
+            
+            # ==================== 学习率调度 ====================
+            if args.use_lr_scheduler:
+                # 计算并应用新的学习率
+                current_lr = get_warmup_cosine_lr(
+                    global_step, args.warmup_steps, total_steps, args.lr, args.min_lr_ratio
+                )
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+                
+                # 记录学习率到TensorBoard
+                writer.add_scalar('Learning_Rate', current_lr, global_step)
 
         # -------------------- 验证阶段 --------------------
         model.eval()  # 设置为评估模式
@@ -223,13 +303,46 @@ if __name__ == '__main__':
         valid_loss_sum /= len(valid_loader)
         writer.add_scalar('Loss/valid', valid_loss_sum, global_step)
 
-        # -------------------- 模型保存 --------------------
-        # 创建保存目录，包含全局步数和验证损失信息
-        save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_sum:.4f}")
-        save_dir.mkdir(parents=True, exist_ok=True)
+        # ==================== 早停检查 ====================
+        save_best_model = False  # 是否保存最佳模型
         
-        # 保存模型权重
-        torch.save(model.state_dict(), save_dir / "model.pt")
+        if args.early_stopping:
+            # 检查验证损失是否有改善
+            if valid_loss_sum < best_val_loss - args.min_delta:
+                # 验证损失有改善
+                best_val_loss = valid_loss_sum
+                patience_counter = 0
+                save_best_model = True
+                print(f"验证损失改善至 {valid_loss_sum:.6f}，重置早停计数器")
+            else:
+                # 验证损失没有改善
+                patience_counter += 1
+                print(f"验证损失未改善 ({valid_loss_sum:.6f} vs {best_val_loss:.6f})，早停计数器: {patience_counter}/{args.patience}")
+                
+                # 检查是否达到早停条件
+                if patience_counter >= args.patience:
+                    early_stop_flag = True
+                    print(f"触发早停机制！连续 {args.patience} 个epoch验证损失未改善，停止训练")
+        else:
+            # 如果不使用早停，则每个epoch都保存模型
+            save_best_model = True
+
+        # -------------------- 模型保存 --------------------
+        if save_best_model:
+            # 创建保存目录，包含全局步数和验证损失信息
+            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_sum:.4f}")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 保存模型权重
+            torch.save(model.state_dict(), save_dir / "model.pt")
+            
+            if args.early_stopping:
+                print(f"保存最佳模型至 {save_dir}")
+        
+        # ==================== 早停条件检查 ====================
+        if args.early_stopping and early_stop_flag:
+            print(f"早停机制生效，在第 {epoch} 个epoch停止训练")
+            break
 
     print("Done")
     writer.close()
