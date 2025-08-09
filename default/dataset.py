@@ -2,7 +2,6 @@ import json
 import pickle
 import struct
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import torch
@@ -45,10 +44,6 @@ class MyDataset(torch.utils.data.Dataset):
 
         self.item_feat_dict = json.load(open(Path(data_dir, "item_feat_dict.json"), 'r'))
         self.mm_emb_dict = load_mm_emb(Path(data_dir, "creative_emb"), self.mm_emb_ids)
-        
-        # ==================== 加载semantic_id特征 ====================
-        # 加载RQ-VAE生成的语义ID特征
-        self.semantic_id_dict = self._load_semantic_ids(data_dir)
         with open(self.data_dir / 'indexer.pkl', 'rb') as ff:
             indexer = pickle.load(ff)
             self.itemnum = len(indexer['i'])
@@ -66,41 +61,6 @@ class MyDataset(torch.utils.data.Dataset):
         self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
-
-    def _load_semantic_ids(self, data_dir):
-        """
-        加载RQ-VAE生成的semantic_id特征
-        
-        Args:
-            data_dir: 数据目录
-            
-        Returns:
-            semantic_id_dict: 语义ID字典 {item_id: [semantic_id_sequence]}
-        """
-        # 首先尝试从数据目录加载
-        semantic_id_file = Path(data_dir) / 'semantic_id_dict.json'
-        if semantic_id_file.exists():
-            print(f"加载semantic_id特征从 {semantic_id_file}")
-            with open(semantic_id_file, 'r') as f:
-                semantic_id_dict = json.load(f)
-            print(f"加载了 {len(semantic_id_dict)} 个物品的semantic_id特征")
-            return semantic_id_dict
-        
-        # 如果数据目录没有，尝试从工作目录加载
-        fallback_file = Path('/workspace') / 'semantic_id_dict.json'
-        if fallback_file.exists():
-            print(f"从工作目录加载semantic_id特征: {fallback_file}")
-            with open(fallback_file, 'r') as f:
-                semantic_id_dict = json.load(f)
-            print(f"加载了 {len(semantic_id_dict)} 个物品的semantic_id特征")
-            return semantic_id_dict
-        
-        # 都没有找到
-        print(f"警告: 未找到semantic_id文件")
-        print(f"  - 尝试过: {semantic_id_file}")
-        print(f"  - 尝试过: {fallback_file}")
-        print("将自动生成semantic_id特征")
-        return {}
 
     def _load_user_data(self, uid):
         """
@@ -251,15 +211,6 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['item_emb'] = self.mm_emb_ids
         feat_types['user_continual'] = []
         feat_types['item_continual'] = []
-        
-        # ==================== 时间特征定义 ====================
-        # 时间特征：这些特征同时适用于用户和物品token
-        feat_types['time_sparse'] = ['time_of_day', 'day_of_week']           # 时间稀疏特征
-        feat_types['time_continual'] = ['time_delta']                        # 时间连续特征
-        
-        # ==================== 添加semantic_id特征 ====================
-        # semantic_id作为item的数组特征，每个物品有一个语义ID序列
-        feat_types['semantic_array'] = ['semantic_id']
 
         for feat_id in feat_types['user_sparse']:
             feat_default_value[feat_id] = 0
@@ -281,26 +232,6 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = np.zeros(
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
             )
-            
-        # ==================== 时间特征默认值和统计信息 ====================
-        # 时间稀疏特征
-        for feat_id in feat_types['time_sparse']:
-            feat_default_value[feat_id] = 0                                   # 时间稀疏特征默认值为0
-            if feat_id == 'time_of_day':
-                feat_statistics[feat_id] = 24                                 # 0-23小时，共24种取值
-            elif feat_id == 'day_of_week':
-                feat_statistics[feat_id] = 7                                  # 0-6天，共7种取值
-                
-        # 时间连续特征
-        for feat_id in feat_types['time_continual']:
-            feat_default_value[feat_id] = 0                                   # 时间连续特征默认值为0
-            
-        # ==================== semantic_id特征默认值和统计信息 ====================
-        for feat_id in feat_types['semantic_array']:
-            # semantic_id的默认值是[0]，表示无语义ID
-            feat_default_value[feat_id] = [0]
-            # 假设有256个codebook，每个有256个值，总共可能的semantic_id数量
-            feat_statistics[feat_id] = 256  # 与RQ-VAE的codebook_size一致
 
         return feat_default_value, feat_types, feat_statistics
 
@@ -331,15 +262,6 @@ class MyDataset(torch.utils.data.Dataset):
             if item_id != 0 and self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
                 if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
                     filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
-        
-        # ==================== 处理semantic_id特征 ====================
-        for feat_id in self.feature_types.get('semantic_array', []):
-            if item_id != 0 and self.semantic_id_dict:
-                # 获取物品的原始ID
-                original_item_id = self.indexer_i_rev.get(item_id)
-                if original_item_id and original_item_id in self.semantic_id_dict:
-                    # 使用RQ-VAE生成的semantic_id序列
-                    filled_feat[feat_id] = self.semantic_id_dict[original_item_id]
 
         return filled_feat
 
@@ -420,61 +342,26 @@ class MyTestDataset(MyDataset):
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
 
         ext_user_sequence = []
-        timestamps = []  # 收集时间戳用于计算时间间隔
-        
         for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, _, timestamp = record_tuple
-            
-            # ==================== 提取时间特征（测试数据集） ====================
-            time_features = {}
-            if timestamp:
-                # 将时间戳转换为datetime对象
-                dt = datetime.fromtimestamp(timestamp)
-                
-                # 提取时间特征
-                time_features['time_of_day'] = dt.hour          # 0-23，表示一天中的小时
-                time_features['day_of_week'] = dt.weekday()     # 0-6，表示一周中的天（0=周一）
-                
-                timestamps.append(timestamp)
-            else:
-                # 如果没有时间戳，使用默认值
-                time_features['time_of_day'] = 0
-                time_features['day_of_week'] = 0
-                timestamps.append(0)
-            
-            # ==================== 计算时间间隔特征 ====================
-            if len(timestamps) > 1 and timestamps[-1] > 0 and timestamps[-2] > 0:
-                # time_delta: 与上一个行为的时间间隔（秒）
-                time_features['time_delta'] = timestamps[-1] - timestamps[-2]
-            else:
-                time_features['time_delta'] = 0  # 第一个行为或无效时间戳的默认值
-            
-            # 处理用户信息
+            u, i, user_feat, item_feat, _, _ = record_tuple
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id
                     user_id = u
                 else:  # 如果是int，说明是re_id
                     user_id = self.indexer_u_rev[u]
-                    
-            # 添加用户token
             if u and user_feat:
                 if type(u) == str:
                     u = 0
                 if user_feat:
                     user_feat = self._process_cold_start_feat(user_feat)
-                    # 将时间特征添加到用户特征中
-                    user_feat.update(time_features)
                 ext_user_sequence.insert(0, (u, user_feat, 2))
 
-            # 添加物品token
             if i and item_feat:
                 # 序列对于训练时没见过的item，不会直接赋0，而是保留creative_id，creative_id远大于训练时的itemnum
                 if i > self.itemnum:
                     i = 0
                 if item_feat:
                     item_feat = self._process_cold_start_feat(item_feat)
-                    # 将时间特征添加到物品特征中
-                    item_feat.update(time_features)
                 ext_user_sequence.append((i, item_feat, 1))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)

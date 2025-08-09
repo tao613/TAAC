@@ -127,15 +127,12 @@ class BaselineModel(torch.nn.Module):
 
         self._init_feat_info(feat_statistics, feat_types)
 
-        userdim = args.hidden_units * (
-            len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + len(self.TIME_SPARSE_FEAT)
-        ) + len(self.USER_CONTINUAL_FEAT) + len(self.TIME_CONTINUAL_FEAT)
-        
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
+            self.USER_CONTINUAL_FEAT
+        )
         itemdim = (
-            args.hidden_units * (
-                len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT) + len(self.TIME_SPARSE_FEAT) + len(self.SEMANTIC_ARRAY_FEAT)
-            )
-            + len(self.ITEM_CONTINUAL_FEAT) + len(self.TIME_CONTINUAL_FEAT)
+            args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
+            + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
@@ -169,16 +166,6 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
-            
-        # ==================== 初始化时间特征Embedding ====================
-        # 时间特征的embedding表
-        for k in self.TIME_SPARSE_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.TIME_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
-            
-        # ==================== 初始化semantic_id特征Embedding ====================
-        # semantic_id作为数组特征，需要embedding表
-        for k in self.SEMANTIC_ARRAY_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.SEMANTIC_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -188,26 +175,14 @@ class BaselineModel(torch.nn.Module):
             feat_statistics: 特征统计信息，key为特征ID，value为特征数量
             feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
         """
-        # 按特征类型分组特征统计信息
-        self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}     # 用户稀疏特征
-        self.USER_CONTINUAL_FEAT = feat_types['user_continual']                               # 用户连续特征
-        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}   # 物品稀疏特征
-        self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']                               # 物品连续特征
-        self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}     # 用户数组特征
-        self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}     # 物品数组特征
-        
-        # ==================== 时间特征处理 ====================
-        # 时间特征同时适用于用户和物品token
-        self.TIME_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types.get('time_sparse', [])}     # 时间稀疏特征
-        self.TIME_CONTINUAL_FEAT = feat_types.get('time_continual', [])                               # 时间连续特征
-        
-        # 多模态特征的维度映射（81-86对应不同的多模态特征类型）
+        self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
+        self.USER_CONTINUAL_FEAT = feat_types['user_continual']
+        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
+        self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']
+        self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}
+        self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
-        
-        # ==================== 添加semantic_id特征支持 ====================
-        # semantic_id作为特殊的数组特征处理
-        self.SEMANTIC_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types.get('semantic_array', [])}
 
     def feat2tensor(self, seq_feature, k):
         """
@@ -220,7 +195,7 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = len(seq_feature)
 
-        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT or k in self.SEMANTIC_ARRAY_FEAT:
+        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
             # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
             max_array_len = 0
             max_seq_len = 0
@@ -275,22 +250,17 @@ class BaselineModel(torch.nn.Module):
 
         # batch-process all feature types
         all_feat_types = [
-            (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),    # 物品稀疏特征
-            (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),      # 物品数组特征
-            (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list), # 物品连续特征
-            (self.TIME_SPARSE_FEAT, 'time_sparse', item_feat_list),    # 时间稀疏特征（应用于物品token）
-            (self.TIME_CONTINUAL_FEAT, 'time_continual', item_feat_list), # 时间连续特征（应用于物品token）
-            (self.SEMANTIC_ARRAY_FEAT, 'semantic_array', item_feat_list),  # 添加semantic_id特征
+            (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),
+            (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
+            (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list),
         ]
 
         if include_user:
             all_feat_types.extend(
                 [
-                    (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),      # 用户稀疏特征
-                    (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),        # 用户数组特征
-                    (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list), # 用户连续特征
-                    (self.TIME_SPARSE_FEAT, 'time_sparse', user_feat_list),      # 时间稀疏特征（应用于用户token）
-                    (self.TIME_CONTINUAL_FEAT, 'time_continual', user_feat_list), # 时间连续特征（应用于用户token）
+                    (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
+                    (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
+                    (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
                 ]
             )
 
@@ -305,9 +275,6 @@ class BaselineModel(torch.nn.Module):
                 if feat_type.endswith('sparse'):
                     feat_list.append(self.sparse_emb[k](tensor_feature))
                 elif feat_type.endswith('array'):
-                    feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
-                elif feat_type == 'semantic_array':
-                    # semantic_id特征的特殊处理：对序列求和
                     feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
                 elif feat_type.endswith('continual'):
                     feat_list.append(tensor_feature.unsqueeze(2))
