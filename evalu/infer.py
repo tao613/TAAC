@@ -245,7 +245,7 @@ def generate_semantic_ids_on_demand(data_path, mm_emb_ids=['81'], args=None):
     按需生成semantic_id特征
     
     当semantic_id文件不存在时，自动训练RQ-VAE并生成semantic_id特征
-    
+
     Args:
         data_path: 数据路径
         mm_emb_ids: 多模态特征ID列表
@@ -721,7 +721,7 @@ def infer():
     print("Loading trained model...")
     # 创建模型实例（需要与训练时的结构一致）
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
-    
+
     # 加载训练好的模型权重
     ckpt_path = get_ckpt_path()
     checkpoint = torch.load(ckpt_path, map_location=torch.device(args.device))

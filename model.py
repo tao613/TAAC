@@ -331,11 +331,12 @@ class BaselineModel(torch.nn.Module):
 
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
         
-        # 初始化自适应相似度计算器（优化项）
-        self.adaptive_similarity = AdaptiveSimilarity(
-            args.hidden_units, 
-            similarity_types=['dot', 'cosine', 'scaled']
-        )
+        # 初始化自适应相似度计算器（优化项）- 仅在明确启用时创建
+        if getattr(args, 'use_adaptive_similarity', False):
+            self.adaptive_similarity = AdaptiveSimilarity(
+                args.hidden_units, 
+                similarity_types=getattr(args, 'similarity_types', ['dot', 'cosine'])
+            )
 
         for _ in range(args.num_blocks):
             new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
