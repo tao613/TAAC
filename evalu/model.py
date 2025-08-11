@@ -8,6 +8,159 @@ from tqdm import tqdm
 from dataset import save_emb
 
 
+class SimilarityCalculator:
+    """
+    高级相似度计算器，提供多种相似度度量方法
+    """
+    
+    @staticmethod
+    def cosine_similarity(x, y, eps=1e-8):
+        """
+        余弦相似度，对向量长度不敏感，更适合捕捉方向性相似度
+        
+        Args:
+            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
+            eps: 防止除零的小常数
+            
+        Returns:
+            similarity: 余弦相似度 [batch_size, seq_len]
+        """
+        x_norm = x / (x.norm(dim=-1, keepdim=True) + eps)
+        y_norm = y / (y.norm(dim=-1, keepdim=True) + eps)
+        return (x_norm * y_norm).sum(dim=-1)
+    
+    @staticmethod
+    def scaled_dot_product(x, y, scale_factor=None):
+        """
+        缩放点积相似度，添加温度参数控制
+        
+        Args:
+            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
+            scale_factor: 缩放因子，默认为 1/sqrt(hidden_dim)
+            
+        Returns:
+            similarity: 缩放点积相似度 [batch_size, seq_len]
+        """
+        if scale_factor is None:
+            scale_factor = 1.0 / (x.size(-1) ** 0.5)
+        return (x * y).sum(dim=-1) * scale_factor
+    
+    @staticmethod
+    def bilinear_similarity(x, y, weight_matrix):
+        """
+        双线性相似度：x^T W y，学习更复杂的相似度函数
+        
+        Args:
+            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
+            weight_matrix: 权重矩阵 [hidden_dim, hidden_dim]
+            
+        Returns:
+            similarity: 双线性相似度 [batch_size, seq_len]
+        """
+        # x: [batch_size, seq_len, hidden_dim]
+        # weight_matrix: [hidden_dim, hidden_dim]
+        # y: [batch_size, seq_len, hidden_dim]
+        
+        batch_size, seq_len, hidden_dim = x.shape
+        
+        # 计算 x @ W
+        x_transformed = torch.matmul(x.view(-1, hidden_dim), weight_matrix)  # [batch_size*seq_len, hidden_dim]
+        x_transformed = x_transformed.view(batch_size, seq_len, hidden_dim)  # [batch_size, seq_len, hidden_dim]
+        
+        # 计算 (x @ W) * y
+        return (x_transformed * y).sum(dim=-1)
+    
+    @staticmethod
+    def euclidean_distance(x, y, eps=1e-8):
+        """
+        欧几里得距离的负值作为相似度（距离越小，相似度越高）
+        
+        Args:
+            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
+            eps: 防止数值不稳定的小常数
+            
+        Returns:
+            similarity: 负欧几里得距离 [batch_size, seq_len]
+        """
+        distance = torch.norm(x - y, dim=-1, p=2)
+        # 转换为相似度（距离越小，相似度越高）
+        return -distance / (distance.max() + eps)
+
+
+class AdaptiveSimilarity(torch.nn.Module):
+    """
+    自适应相似度融合模块，学习不同相似度度量的最优组合
+    """
+    
+    def __init__(self, hidden_dim, similarity_types=['dot', 'cosine', 'scaled']):
+        super(AdaptiveSimilarity, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.similarity_types = similarity_types
+        
+        # 可学习的融合权重
+        self.alpha = torch.nn.Parameter(torch.ones(1) * 0.5)  # 原始点积权重
+        self.beta = torch.nn.Parameter(torch.ones(1) * 0.3)   # 余弦相似度权重
+        self.gamma = torch.nn.Parameter(torch.ones(1) * 0.2)  # 缩放点积权重
+        
+        # 双线性相似度的权重矩阵
+        if 'bilinear' in similarity_types:
+            self.bilinear_weight = torch.nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 0.1)
+            self.delta = torch.nn.Parameter(torch.ones(1) * 0.1)  # 双线性相似度权重
+        
+        # 温度参数
+        self.temperature = torch.nn.Parameter(torch.ones(1) * 1.0)
+        
+    def forward(self, seq_repr, item_repr):
+        """
+        计算自适应相似度
+        
+        Args:
+            seq_repr: 序列表示 [batch_size, seq_len, hidden_dim]
+            item_repr: 物品表示 [batch_size, seq_len, hidden_dim]
+            
+        Returns:
+            similarity: 融合后的相似度 [batch_size, seq_len]
+        """
+        similarities = []
+        
+        # 基础点积相似度
+        if 'dot' in self.similarity_types:
+            dot_sim = (seq_repr * item_repr).sum(dim=-1)
+            similarities.append(self.alpha * dot_sim)
+        
+        # 余弦相似度
+        if 'cosine' in self.similarity_types:
+            cos_sim = SimilarityCalculator.cosine_similarity(seq_repr, item_repr)
+            similarities.append(self.beta * cos_sim)
+        
+        # 缩放点积相似度
+        if 'scaled' in self.similarity_types:
+            scaled_sim = SimilarityCalculator.scaled_dot_product(seq_repr, item_repr)
+            similarities.append(self.gamma * scaled_sim)
+        
+        # 双线性相似度
+        if 'bilinear' in self.similarity_types and hasattr(self, 'bilinear_weight'):
+            bilinear_sim = SimilarityCalculator.bilinear_similarity(seq_repr, item_repr, self.bilinear_weight)
+            similarities.append(self.delta * bilinear_sim)
+        
+        # 欧几里得距离
+        if 'euclidean' in self.similarity_types:
+            euclidean_sim = SimilarityCalculator.euclidean_distance(seq_repr, item_repr)
+            similarities.append(0.1 * euclidean_sim)  # 通常权重较小
+        
+        # 融合所有相似度
+        if len(similarities) == 1:
+            final_similarity = similarities[0]
+        else:
+            final_similarity = torch.stack(similarities, dim=-1).sum(dim=-1)
+        
+        # 应用温度缩放
+        final_similarity = final_similarity * self.temperature
+        
+        return final_similarity
+
+
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()

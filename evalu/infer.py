@@ -32,6 +32,91 @@ def get_ckpt_path():
             return os.path.join(ckpt_path, item)
 
 
+def load_training_config():
+    """
+    从模型检查点目录加载训练配置
+    
+    Returns:
+        dict or None: 训练配置字典，如果找不到则返回None
+    """
+    ckpt_path = os.environ.get("MODEL_OUTPUT_PATH")
+    if ckpt_path is None:
+        return None
+    
+    # 查找config.json文件
+    config_file = None
+    for item in os.listdir(ckpt_path):
+        if item == "config.json":
+            config_file = os.path.join(ckpt_path, item)
+            break
+    
+    if config_file and os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                print(f"成功加载训练配置: {config_file}")
+                return config.get('args', {})
+        except Exception as e:
+            print(f"加载训练配置失败: {e}")
+            return None
+    else:
+        print("未找到config.json文件，将使用默认参数")
+        return None
+
+
+def configure_model_optimizations(model, checkpoint, args):
+    """
+    根据checkpoint内容智能配置模型优化模块
+    
+    Args:
+        model: 基础模型实例
+        checkpoint: 加载的模型权重
+        args: 参数配置
+        
+    Returns:
+        model: 配置好的模型实例
+    """
+    checkpoint_keys = set(checkpoint.keys())
+    
+    # 检测是否使用了自适应相似度模块
+    adaptive_keys = [k for k in checkpoint_keys if k.startswith('adaptive_similarity.')]
+    
+    if adaptive_keys:
+        print("检测到自适应相似度模块权重，正在配置...")
+        
+        # 从权重名称推断使用的相似度类型
+        similarity_types = ['dot']  # 默认包含点积
+        
+        if any('beta' in k for k in adaptive_keys):
+            similarity_types.append('cosine')
+        if any('gamma' in k for k in adaptive_keys):
+            similarity_types.append('scaled')
+        
+        # 设置参数
+        args.use_adaptive_similarity = True
+        args.similarity_types = similarity_types
+        
+        # 初始化自适应相似度模块
+        from model import AdaptiveSimilarity
+        model.adaptive_similarity = AdaptiveSimilarity(
+            args.hidden_units, 
+            similarity_types=similarity_types
+        ).to(args.device)
+        print(f"已配置自适应相似度模块: {similarity_types}")
+    
+    elif args.use_adaptive_similarity:
+        # 用户手动指定使用自适应相似度，但checkpoint中没有对应权重
+        print("用户指定使用自适应相似度，但checkpoint中未找到对应权重，使用随机初始化...")
+        from model import AdaptiveSimilarity
+        model.adaptive_similarity = AdaptiveSimilarity(
+            args.hidden_units, 
+            similarity_types=args.similarity_types
+        ).to(args.device)
+        print(f"已初始化新的自适应相似度模块: {args.similarity_types}")
+    
+    return model
+
+
 def get_args():
     """
     解析评估推理的命令行参数
@@ -63,8 +148,34 @@ def get_args():
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, 
                        choices=[str(s) for s in range(81, 87)],
                        help='激活的多模态特征ID列表')
+    
+    # 优化功能参数（用于兼容训练时的模型结构）
+    parser.add_argument('--use_adaptive_similarity', action='store_true', help='是否使用自适应相似度计算')
+    parser.add_argument('--similarity_types', nargs='+', default=['dot', 'cosine'], 
+                       choices=['dot', 'cosine', 'scaled', 'bilinear', 'euclidean'], 
+                       help='相似度计算类型')
+    parser.add_argument('--use_smart_sampling', action='store_true', help='是否使用智能负采样')
+    parser.add_argument('--use_curriculum_learning', action='store_true', help='是否使用课程学习')
+    parser.add_argument('--curriculum_schedule', default='linear', 
+                       choices=['linear', 'cosine', 'exponential'], 
+                       help='课程学习难度调度策略')
+    parser.add_argument('--neg_sample_ratio', default=1, type=int, help='负样本采样比例')
 
     args = parser.parse_args()
+
+    # 尝试从训练配置中自动加载参数
+    training_config = load_training_config()
+    if training_config:
+        print("=== 自动应用训练配置 ===")
+        for key, value in training_config.items():
+            if hasattr(args, key):
+                old_value = getattr(args, key)
+                setattr(args, key, value)
+                if old_value != value:
+                    print(f"  {key}: {old_value} -> {value}")
+            else:
+                print(f"  跳过未知参数: {key} = {value}")
+        print("========================")
 
     return args
 
@@ -578,35 +689,47 @@ def infer():
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
     
     # ==================== 加载或生成semantic_id特征 ====================
-    semantic_id_dict = test_dataset.semantic_id_dict
+    # 安全获取semantic_id_dict属性
+    semantic_id_dict = getattr(test_dataset, 'semantic_id_dict', None)
+    
     if semantic_id_dict:
         print(f"成功加载 {len(semantic_id_dict)} 个物品的semantic_id特征")
     else:
         print("未找到semantic_id特征，尝试自动生成...")
-        # 按需生成semantic_id特征
-        semantic_id_dict = generate_semantic_ids_on_demand(
-            data_path=data_path,
-            mm_emb_ids=args.mm_emb_id,
-            args=args
-        )
-        
-        if semantic_id_dict:
-            print(f"成功生成 {len(semantic_id_dict)} 个物品的semantic_id特征")
-            # 重新加载dataset以获取更新后的特征
-            test_dataset = MyTestDataset(data_path, args)
-            semantic_id_dict = test_dataset.semantic_id_dict
-        else:
-            print("semantic_id生成失败，将使用默认值")
+        try:
+            # 按需生成semantic_id特征
+            semantic_id_dict = generate_semantic_ids_on_demand(
+                data_path=data_path,
+                mm_emb_ids=args.mm_emb_id,
+                args=args
+            )
+            
+            if semantic_id_dict:
+                print(f"成功生成 {len(semantic_id_dict)} 个物品的semantic_id特征")
+                # 重新加载dataset以获取更新后的特征
+                test_dataset = MyTestDataset(data_path, args)
+                semantic_id_dict = getattr(test_dataset, 'semantic_id_dict', None)
+            else:
+                print("semantic_id生成失败，将使用默认值")
+                semantic_id_dict = {}
+        except Exception as e:
+            print(f"semantic_id处理出错: {e}")
+            print("将使用空的semantic_id_dict继续处理")
+            semantic_id_dict = {}
     
     # ==================== 模型加载 ====================
     print("Loading trained model...")
     # 创建模型实例（需要与训练时的结构一致）
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
-    model.eval()  # 设置为评估模式
-
+    
     # 加载训练好的模型权重
     ckpt_path = get_ckpt_path()
     checkpoint = torch.load(ckpt_path, map_location=torch.device(args.device))
+    
+    # 智能检测并配置优化模块
+    model = configure_model_optimizations(model, checkpoint, args)
+    
+    model.eval()  # 设置为评估模式
     
     # ==================== 智能模型权重兼容处理 ====================
     # 处理模型结构变化导致的权重不匹配问题
@@ -617,6 +740,11 @@ def infer():
     # 找出不匹配的权重
     missing_in_model = checkpoint_keys - model_keys  # checkpoint中有但模型中没有
     missing_in_checkpoint = model_keys - checkpoint_keys  # 模型中有但checkpoint中没有
+    
+    if missing_in_model:
+        print(f"警告：模型中缺失的权重（将被忽略）: {missing_in_model}")
+    if missing_in_checkpoint:
+        print(f"警告：checkpoint中缺失的权重（将使用随机初始化）: {missing_in_checkpoint}")
     
     # 处理维度不匹配的权重（如itemdnn.weight）
     compatible_checkpoint = {}

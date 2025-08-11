@@ -48,7 +48,13 @@ class MyDataset(torch.utils.data.Dataset):
         
         # ==================== 加载semantic_id特征 ====================
         # 加载RQ-VAE生成的语义ID特征
-        self.semantic_id_dict = self._load_semantic_ids(data_dir)
+        try:
+            self.semantic_id_dict = self._load_semantic_ids(data_dir)
+            if self.semantic_id_dict is None:
+                self.semantic_id_dict = {}
+        except Exception as e:
+            print(f"加载semantic_id特征时出错: {e}")
+            self.semantic_id_dict = {}
         with open(self.data_dir / 'indexer.pkl', 'rb') as ff:
             indexer = pickle.load(ff)
             self.itemnum = len(indexer['i'])
