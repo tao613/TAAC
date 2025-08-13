@@ -27,16 +27,16 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=256, type=int)  # 匹配训练时的batch_size
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.0007, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction - 调整为匹配训练时的模型结构
     parser.add_argument('--hidden_units', default=64, type=int)  # 从32改为64
     parser.add_argument('--num_blocks', default=2, type=int)     # 从1改为2
-    parser.add_argument('--num_epochs', default=3, type=int)
+    parser.add_argument('--num_epochs', default=4, type=int)
     parser.add_argument('--num_heads', default=2, type=int)      # 从1改为2
     parser.add_argument('--dropout_rate', default=0.2, type=float)
-    parser.add_argument('--l2_emb', default=0.0, type=float)
+    parser.add_argument('--l2_emb', default=0.000001, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
@@ -47,7 +47,7 @@ def get_args():
     
     # InfoNCE Loss parameters (for model compatibility)
     parser.add_argument('--use_infonce', action='store_true', help='Use InfoNCE loss instead of BCE loss')
-    parser.add_argument('--infonce_temperature', default=0.2, type=float, help='Temperature parameter for InfoNCE loss')
+    parser.add_argument('--infonce_temperature', default=0.07, type=float, help='Temperature parameter for InfoNCE loss')
 
     args = parser.parse_args()
 
