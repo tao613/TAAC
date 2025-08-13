@@ -26,24 +26,28 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     # Train params
-    parser.add_argument('--batch_size', default=128, type=int)
+    parser.add_argument('--batch_size', default=256, type=int)  # 匹配训练时的batch_size
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
-    # Baseline Model construction
-    parser.add_argument('--hidden_units', default=32, type=int)
-    parser.add_argument('--num_blocks', default=1, type=int)
+    # Baseline Model construction - 调整为匹配训练时的模型结构
+    parser.add_argument('--hidden_units', default=64, type=int)  # 从32改为64
+    parser.add_argument('--num_blocks', default=2, type=int)     # 从1改为2
     parser.add_argument('--num_epochs', default=3, type=int)
-    parser.add_argument('--num_heads', default=1, type=int)
+    parser.add_argument('--num_heads', default=2, type=int)      # 从1改为2
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
-    parser.add_argument('--norm_first', action='store_true')
+    parser.add_argument('--norm_first', action='store_true', default=True)  # 默认启用Pre-LayerNorm
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    
+    # InfoNCE Loss parameters (for model compatibility)
+    parser.add_argument('--use_infonce', action='store_true', help='Use InfoNCE loss instead of BCE loss')
+    parser.add_argument('--infonce_temperature', default=0.2, type=float, help='Temperature parameter for InfoNCE loss')
 
     args = parser.parse_args()
 

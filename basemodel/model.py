@@ -8,168 +8,7 @@ from tqdm import tqdm
 from dataset import save_emb
 
 
-class SimilarityCalculator:
-    """
-    高级相似度计算器，提供多种相似度度量方法
-    """
-    
-    @staticmethod
-    def cosine_similarity(x, y, eps=1e-8):
-        """
-        余弦相似度，对向量长度不敏感，更适合捕捉方向性相似度
-        
-        Args:
-            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
-            eps: 防止除零的小常数
-            
-        Returns:
-            similarity: 余弦相似度 [batch_size, seq_len]
-        """
-        x_norm = x / (x.norm(dim=-1, keepdim=True) + eps)
-        y_norm = y / (y.norm(dim=-1, keepdim=True) + eps)
-        return (x_norm * y_norm).sum(dim=-1)
-    
-    @staticmethod
-    def scaled_dot_product(x, y, scale_factor=None):
-        """
-        缩放点积相似度，添加温度参数控制
-        
-        Args:
-            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
-            scale_factor: 缩放因子，默认为 1/sqrt(hidden_dim)
-            
-        Returns:
-            similarity: 缩放点积相似度 [batch_size, seq_len]
-        """
-        if scale_factor is None:
-            scale_factor = 1.0 / (x.size(-1) ** 0.5)
-        return (x * y).sum(dim=-1) * scale_factor
-    
-    @staticmethod
-    def bilinear_similarity(x, y, weight_matrix):
-        """
-        双线性相似度：x^T W y，学习更复杂的相似度函数
-        
-        Args:
-            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
-            weight_matrix: 权重矩阵 [hidden_dim, hidden_dim]
-            
-        Returns:
-            similarity: 双线性相似度 [batch_size, seq_len]
-        """
-        # x: [batch_size, seq_len, hidden_dim]
-        # weight_matrix: [hidden_dim, hidden_dim]
-        # y: [batch_size, seq_len, hidden_dim]
-        
-        batch_size, seq_len, hidden_dim = x.shape
-        
-        # 计算 x @ W
-        x_transformed = torch.matmul(x.view(-1, hidden_dim), weight_matrix)  # [batch_size*seq_len, hidden_dim]
-        x_transformed = x_transformed.view(batch_size, seq_len, hidden_dim)  # [batch_size, seq_len, hidden_dim]
-        
-        # 计算 (x @ W) * y
-        return (x_transformed * y).sum(dim=-1)
-    
-    @staticmethod
-    def euclidean_distance(x, y, eps=1e-8):
-        """
-        欧几里得距离的负值作为相似度（距离越小，相似度越高）
-        
-        Args:
-            x, y: 输入张量 [batch_size, seq_len, hidden_dim]
-            eps: 防止数值不稳定的小常数
-            
-        Returns:
-            similarity: 负欧几里得距离 [batch_size, seq_len]
-        """
-        distance = torch.norm(x - y, dim=-1, p=2)
-        # 转换为相似度（距离越小，相似度越高）
-        return -distance / (distance.max() + eps)
-
-
-class AdaptiveSimilarity(torch.nn.Module):
-    """
-    自适应相似度融合模块，学习不同相似度度量的最优组合
-    """
-    
-    def __init__(self, hidden_dim, similarity_types=['dot', 'cosine', 'scaled']):
-        super(AdaptiveSimilarity, self).__init__()
-        
-        self.hidden_dim = hidden_dim
-        self.similarity_types = similarity_types
-        
-        # 可学习的融合权重
-        self.alpha = torch.nn.Parameter(torch.ones(1) * 0.5)  # 原始点积权重
-        self.beta = torch.nn.Parameter(torch.ones(1) * 0.3)   # 余弦相似度权重
-        self.gamma = torch.nn.Parameter(torch.ones(1) * 0.2)  # 缩放点积权重
-        
-        # 双线性相似度的权重矩阵
-        if 'bilinear' in similarity_types:
-            self.bilinear_weight = torch.nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 0.1)
-            self.delta = torch.nn.Parameter(torch.ones(1) * 0.1)  # 双线性相似度权重
-        
-        # 温度参数
-        self.temperature = torch.nn.Parameter(torch.ones(1) * 1.0)
-        
-    def forward(self, seq_repr, item_repr):
-        """
-        计算自适应相似度
-        
-        Args:
-            seq_repr: 序列表示 [batch_size, seq_len, hidden_dim]
-            item_repr: 物品表示 [batch_size, seq_len, hidden_dim]
-            
-        Returns:
-            similarity: 融合后的相似度 [batch_size, seq_len]
-        """
-        similarities = []
-        
-        # 基础点积相似度
-        if 'dot' in self.similarity_types:
-            dot_sim = (seq_repr * item_repr).sum(dim=-1)
-            similarities.append(self.alpha * dot_sim)
-        
-        # 余弦相似度
-        if 'cosine' in self.similarity_types:
-            cos_sim = SimilarityCalculator.cosine_similarity(seq_repr, item_repr)
-            similarities.append(self.beta * cos_sim)
-        
-        # 缩放点积相似度
-        if 'scaled' in self.similarity_types:
-            scaled_sim = SimilarityCalculator.scaled_dot_product(seq_repr, item_repr)
-            similarities.append(self.gamma * scaled_sim)
-        
-        # 双线性相似度
-        if 'bilinear' in self.similarity_types and hasattr(self, 'bilinear_weight'):
-            bilinear_sim = SimilarityCalculator.bilinear_similarity(seq_repr, item_repr, self.bilinear_weight)
-            similarities.append(self.delta * bilinear_sim)
-        
-        # 欧几里得距离
-        if 'euclidean' in self.similarity_types:
-            euclidean_sim = SimilarityCalculator.euclidean_distance(seq_repr, item_repr)
-            similarities.append(0.1 * euclidean_sim)  # 通常权重较小
-        
-        # 融合所有相似度
-        if len(similarities) == 1:
-            final_similarity = similarities[0]
-        else:
-            final_similarity = torch.stack(similarities, dim=-1).sum(dim=-1)
-        
-        # 应用温度缩放
-        final_similarity = final_similarity * self.temperature
-        
-        return final_similarity
-
-
 class FlashMultiHeadAttention(torch.nn.Module):
-    """
-    优化的多头自注意力机制，使用Flash Attention
-    
-    Args:
-        hidden_units: 隐藏层维度
-        num_heads: 注意力头数
-        dropout_rate: Dropout比例
-    """
     def __init__(self, hidden_units, num_heads, dropout_rate):
         super(FlashMultiHeadAttention, self).__init__()
 
@@ -186,17 +25,6 @@ class FlashMultiHeadAttention(torch.nn.Module):
         self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
 
     def forward(self, query, key, value, attn_mask=None):
-        """
-        前向传播
-        
-        Args:
-            query, key, value: 查询、键、值张量 [batch_size, seq_len, hidden_units]
-            attn_mask: 注意力掩码 [batch_size, seq_len, seq_len]
-            
-        Returns:
-            output: 注意力输出 [batch_size, seq_len, hidden_units]
-            None: 占位符，保持接口一致性
-        """
         batch_size, seq_len, _ = query.size()
 
         # 计算Q, K, V
@@ -236,13 +64,6 @@ class FlashMultiHeadAttention(torch.nn.Module):
 
 
 class PointWiseFeedForward(torch.nn.Module):
-    """
-    点式前馈网络
-    
-    Args:
-        hidden_units: 隐藏层维度
-        dropout_rate: Dropout比例
-    """
     def __init__(self, hidden_units, dropout_rate):
         super(PointWiseFeedForward, self).__init__()
 
@@ -253,15 +74,6 @@ class PointWiseFeedForward(torch.nn.Module):
         self.dropout2 = torch.nn.Dropout(p=dropout_rate)
 
     def forward(self, inputs):
-        """
-        前向传播
-        
-        Args:
-            inputs: 输入张量 [batch_size, seq_len, hidden_units]
-            
-        Returns:
-            outputs: 输出张量 [batch_size, seq_len, hidden_units]
-        """
         outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
         outputs = outputs.transpose(-1, -2)  # as Conv1D requires (N, C, Length)
         return outputs
@@ -269,8 +81,6 @@ class PointWiseFeedForward(torch.nn.Module):
 
 class BaselineModel(torch.nn.Module):
     """
-    基线模型：Transformer序列推荐模型
-    
     Args:
         user_num: 用户数量
         item_num: 物品数量
@@ -300,6 +110,8 @@ class BaselineModel(torch.nn.Module):
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
+        # InfoNCE loss temperature parameter
+        self.temp = getattr(args, 'infonce_temperature', 0.2)
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
         # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
@@ -317,15 +129,12 @@ class BaselineModel(torch.nn.Module):
 
         self._init_feat_info(feat_statistics, feat_types)
 
-        userdim = args.hidden_units * (
-            len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + len(self.TIME_SPARSE_FEAT)
-        ) + len(self.USER_CONTINUAL_FEAT) + len(self.TIME_CONTINUAL_FEAT)
-        
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
+            self.USER_CONTINUAL_FEAT
+        )
         itemdim = (
-            args.hidden_units * (
-                len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT) + len(self.TIME_SPARSE_FEAT) + len(self.SEMANTIC_ARRAY_FEAT)
-            )
-            + len(self.ITEM_CONTINUAL_FEAT) + len(self.TIME_CONTINUAL_FEAT)
+            args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
+            + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
@@ -333,13 +142,6 @@ class BaselineModel(torch.nn.Module):
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
 
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-        
-        # 初始化自适应相似度计算器（优化项）- 仅在明确启用时创建
-        if getattr(args, 'use_adaptive_similarity', False):
-            self.adaptive_similarity = AdaptiveSimilarity(
-                args.hidden_units, 
-                similarity_types=getattr(args, 'similarity_types', ['dot', 'cosine'])
-            )
 
         for _ in range(args.num_blocks):
             new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
@@ -366,16 +168,6 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
-            
-        # ==================== 初始化时间特征Embedding ====================
-        # 时间特征的embedding表
-        for k in self.TIME_SPARSE_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.TIME_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
-            
-        # ==================== 初始化semantic_id特征Embedding ====================
-        # semantic_id作为数组特征，需要embedding表
-        for k in self.SEMANTIC_ARRAY_FEAT:
-            self.sparse_emb[k] = torch.nn.Embedding(self.SEMANTIC_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -385,26 +177,14 @@ class BaselineModel(torch.nn.Module):
             feat_statistics: 特征统计信息，key为特征ID，value为特征数量
             feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
         """
-        # 按特征类型分组特征统计信息
-        self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}     # 用户稀疏特征
-        self.USER_CONTINUAL_FEAT = feat_types['user_continual']                               # 用户连续特征
-        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}   # 物品稀疏特征
-        self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']                               # 物品连续特征
-        self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}     # 用户数组特征
-        self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}     # 物品数组特征
-        
-        # ==================== 时间特征处理 ====================
-        # 时间特征同时适用于用户和物品token
-        self.TIME_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types.get('time_sparse', [])}     # 时间稀疏特征
-        self.TIME_CONTINUAL_FEAT = feat_types.get('time_continual', [])                               # 时间连续特征
-        
-        # 多模态特征的维度映射（81-86对应不同的多模态特征类型）
+        self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
+        self.USER_CONTINUAL_FEAT = feat_types['user_continual']
+        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
+        self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']
+        self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}
+        self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
-        
-        # ==================== 添加semantic_id特征支持 ====================
-        # semantic_id作为特殊的数组特征处理
-        self.SEMANTIC_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types.get('semantic_array', [])}
 
     def feat2tensor(self, seq_feature, k):
         """
@@ -417,7 +197,7 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = len(seq_feature)
 
-        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT or k in self.SEMANTIC_ARRAY_FEAT:
+        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
             # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
             max_array_len = 0
             max_seq_len = 0
@@ -472,22 +252,17 @@ class BaselineModel(torch.nn.Module):
 
         # batch-process all feature types
         all_feat_types = [
-            (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),    # 物品稀疏特征
-            (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),      # 物品数组特征
-            (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list), # 物品连续特征
-            (self.TIME_SPARSE_FEAT, 'time_sparse', item_feat_list),    # 时间稀疏特征（应用于物品token）
-            (self.TIME_CONTINUAL_FEAT, 'time_continual', item_feat_list), # 时间连续特征（应用于物品token）
-            (self.SEMANTIC_ARRAY_FEAT, 'semantic_array', item_feat_list),  # 添加semantic_id特征
+            (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),
+            (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
+            (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list),
         ]
 
         if include_user:
             all_feat_types.extend(
                 [
-                    (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),      # 用户稀疏特征
-                    (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),        # 用户数组特征
-                    (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list), # 用户连续特征
-                    (self.TIME_SPARSE_FEAT, 'time_sparse', user_feat_list),      # 时间稀疏特征（应用于用户token）
-                    (self.TIME_CONTINUAL_FEAT, 'time_continual', user_feat_list), # 时间连续特征（应用于用户token）
+                    (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
+                    (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
+                    (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
                 ]
             )
 
@@ -502,9 +277,6 @@ class BaselineModel(torch.nn.Module):
                 if feat_type.endswith('sparse'):
                     feat_list.append(self.sparse_emb[k](tensor_feature))
                 elif feat_type.endswith('array'):
-                    feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
-                elif feat_type == 'semantic_array':
-                    # semantic_id特征的特殊处理：对序列求和
                     feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
                 elif feat_type.endswith('continual'):
                     feat_list.append(tensor_feature.unsqueeze(2))
@@ -605,38 +377,128 @@ class BaselineModel(torch.nn.Module):
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        # 使用优化的相似度计算（可选择原始方法或自适应方法）
-        if hasattr(self, 'adaptive_similarity'):
-            # 使用自适应相似度计算
-            pos_logits = self.adaptive_similarity(log_feats, pos_embs)
-            neg_logits = self.adaptive_similarity(log_feats, neg_embs)
-        else:
-            # 原始点积相似度计算
-            pos_logits = (log_feats * pos_embs).sum(dim=-1)
-            neg_logits = (log_feats * neg_embs).sum(dim=-1)
-        
-        # 应用损失掩码
+        pos_logits = (log_feats * pos_embs).sum(dim=-1)
+        neg_logits = (log_feats * neg_embs).sum(dim=-1)
         pos_logits = pos_logits * loss_mask
         neg_logits = neg_logits * loss_mask
 
         return pos_logits, neg_logits
 
+    def compute_infonce_loss(self, seq_embs, pos_embs, neg_embs, loss_mask, writer=None):
+        """
+        计算InfoNCE损失 - 使用in-batch negatives
+        
+        Args:
+            seq_embs: 序列表示 [batch_size, maxlen, hidden_units]
+            pos_embs: 正样本表示 [batch_size, maxlen, hidden_units]  
+            neg_embs: 负样本表示 [batch_size, maxlen, hidden_units] (随机负样本，用于in-batch)
+            loss_mask: 损失掩码 [batch_size, maxlen] (1表示有效item位置，0表示padding)
+            writer: TensorBoard writer (可选)
+            
+        Returns:
+            loss: InfoNCE损失
+        """
+        batch_size, maxlen, hidden_size = seq_embs.size()
+        
+        # 1. L2归一化所有embedding
+        seq_embs_norm = seq_embs / (seq_embs.norm(dim=-1, keepdim=True) + 1e-8)
+        pos_embs_norm = pos_embs / (pos_embs.norm(dim=-1, keepdim=True) + 1e-8)
+        neg_embs_norm = neg_embs / (neg_embs.norm(dim=-1, keepdim=True) + 1e-8)
+        
+        # 2. 计算正样本相似度 (余弦相似度)
+        pos_logits = F.cosine_similarity(seq_embs_norm, pos_embs_norm, dim=-1)  # [batch_size, maxlen]
+        
+        # 3. 构建in-batch negatives - 只使用随机负样本，避免false negatives
+        # 将所有随机负样本reshape为候选池 [batch_size * maxlen, hidden_size]
+        neg_pool = neg_embs_norm.view(batch_size * maxlen, hidden_size)  # 所有neg作为候选
+        
+        # 对每个序列位置，计算与所有neg候选的相似度
+        seq_flat = seq_embs_norm.view(batch_size * maxlen, hidden_size)  # [batch_size * maxlen, hidden_size]
+        neg_logits_all = torch.matmul(seq_flat, neg_pool.t())  # [batch_size * maxlen, batch_size * maxlen]
+        
+        # 重新reshape为 [batch_size, maxlen, batch_size * maxlen]
+        neg_logits = neg_logits_all.view(batch_size, maxlen, batch_size * maxlen)
+        
+        # 4. 只保留有效位置的logits (过滤padding)
+        valid_positions = loss_mask.bool()  # [batch_size, maxlen]
+        
+        # 提取有效位置的logits
+        valid_pos_logits = pos_logits[valid_positions]  # [num_valid_positions]
+        valid_neg_logits = neg_logits[valid_positions]  # [num_valid_positions, batch_size * maxlen]
+        
+        if valid_pos_logits.size(0) == 0:
+            # 没有有效位置，返回0损失
+            return torch.tensor(0.0, device=seq_embs.device, requires_grad=True)
+        
+        # 5. 拼接正负样本logits - 正样本在第0位
+        pos_logits_expanded = valid_pos_logits.unsqueeze(1)  # [num_valid_positions, 1]
+        all_logits = torch.cat([pos_logits_expanded, valid_neg_logits], dim=1)  # [num_valid_positions, 1 + batch_size * maxlen]
+        
+        # 6. 应用温度参数
+        all_logits = all_logits / self.temp
+        
+        # 7. 标签：正样本在第0位
+        labels = torch.zeros(all_logits.size(0), device=seq_embs.device, dtype=torch.long)
+        
+        # 8. 计算交叉熵损失
+        loss = F.cross_entropy(all_logits, labels)
+        
+        # 9. 记录统计信息
+        if writer is not None:
+            writer.add_scalar("Model/nce_pos_logits", valid_pos_logits.mean().item())
+            writer.add_scalar("Model/nce_neg_logits", valid_neg_logits.mean().item())
+            writer.add_scalar("Model/nce_temperature", self.temp)
+            writer.add_scalar("Model/nce_valid_positions", valid_pos_logits.size(0))
+        
+        return loss
+
+    def forward_infonce(self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature, writer=None):
+        """
+        InfoNCE版本的前向传播
+        
+        Args:
+            user_item: 用户序列ID
+            pos_seqs: 正样本序列ID
+            neg_seqs: 负样本序列ID
+            mask: token类型掩码，1表示item token，2表示user token
+            next_mask: 下一个token类型掩码，1表示item token，2表示user token
+            next_action_type: 下一个token动作类型，0表示曝光，1表示点击
+            seq_feature: 序列特征list，每个元素为当前时刻的特征字典
+            pos_feature: 正样本特征list，每个元素为当前时刻的特征字典
+            neg_feature: 负样本特征list，每个元素为当前时刻的特征字典
+            writer: TensorBoard writer (可选)
+            
+        Returns:
+            loss: InfoNCE损失
+        """
+        log_feats = self.log2feats(user_item, mask, seq_feature)
+        loss_mask = (next_mask == 1).to(self.dev)
+
+        pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
+        neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
+
+        # 计算InfoNCE损失
+        loss = self.compute_infonce_loss(log_feats, pos_embs, neg_embs, loss_mask, writer)
+        
+        return loss
+
     def predict(self, log_seqs, seq_feature, mask):
         """
         计算用户序列的表征
-        
         Args:
             log_seqs: 用户序列ID
             seq_feature: 序列特征list，每个元素为当前时刻的特征字典
             mask: token类型掩码，1表示item token，2表示user token
-            
         Returns:
             final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
         """
         log_feats = self.log2feats(log_seqs, mask, seq_feature)
-
         final_feat = log_feats[:, -1, :]
-
+        
+        # 如果使用InfoNCE训练，推理时也需要L2归一化以保持一致性
+        if hasattr(self, 'temp'):  # 检查是否使用InfoNCE
+            final_feat = final_feat / (final_feat.norm(dim=-1, keepdim=True) + 1e-8)
+        
         return final_feat
 
     def save_item_emb(self, item_ids, retrieval_ids, feat_dict, save_path, batch_size=1024):
@@ -663,6 +525,10 @@ class BaselineModel(torch.nn.Module):
             batch_feat = np.array(batch_feat, dtype=object)
 
             batch_emb = self.feat2emb(item_seq, [batch_feat], include_user=False).squeeze(0)
+            
+            # 如果使用InfoNCE训练，候选item embedding也需要L2归一化
+            if hasattr(self, 'temp'):  # 检查是否使用InfoNCE
+                batch_emb = batch_emb / (batch_emb.norm(dim=-1, keepdim=True) + 1e-8)
 
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
