@@ -1,0 +1,4 @@
+1. timestamp
+2. Pre-LayerNorm
+3. Training otp learning rate
+4. Early stop
