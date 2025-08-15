@@ -91,7 +91,7 @@ def get_args():
                        help='是否使用In-batch Negatives策略（默认启用，与InfoNCE Loss配合）')
     parser.add_argument('--use_infonce_loss', action='store_true', default=True,
                        help='是否使用InfoNCE Loss（默认启用，对比学习损失函数）')
-    parser.add_argument('--temperature', default=0.07, type=float,
+    parser.add_argument('--temperature', default=0.2, type=float,
                        help='InfoNCE Loss的温度参数，控制分布的尖锐程度')
     parser.add_argument('--max_negatives_per_query', default=100, type=int,
                        help='每个查询的最大负样本数量（用于内存优化）')
@@ -180,7 +180,7 @@ if __name__ == '__main__':
     # 使用InfoNCE损失，适用于对比学习任务
     def info_nce_loss(query, pos_key, neg_keys, temperature=0.07):
         """
-        InfoNCE损失函数实现
+        InfoNCE损失函数实现（修复版本）
         
         Args:
             query: 查询向量 [N, D]
@@ -191,6 +191,11 @@ if __name__ == '__main__':
         Returns:
             loss: InfoNCE损失
         """
+        # L2归一化，稳定训练
+        query = F.normalize(query, p=2, dim=-1)
+        pos_key = F.normalize(pos_key, p=2, dim=-1)
+        neg_keys = F.normalize(neg_keys, p=2, dim=-1)
+        
         # 计算正样本相似度 [N]
         pos_sim = torch.sum(query * pos_key, dim=-1) / temperature
         
@@ -295,17 +300,21 @@ if __name__ == '__main__':
                 loss = bce_criterion(pos_logits[indices], pos_labels[indices])
                 loss += bce_criterion(neg_logits[indices], neg_labels[indices])
 
-            # 添加item embedding的L2正则化
+            # 添加item embedding的L2正则化（分离计算，避免影响主损失）
+            l2_loss = 0
             for param in model.item_emb.parameters():
-                loss += args.l2_emb * torch.norm(param)
+                l2_loss += args.l2_emb * torch.norm(param)
+            
+            # 总损失 = 主损失 + L2正则化
+            total_loss = loss + l2_loss
                 
             # 反向传播和参数更新
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
             
-            # 记录训练日志
+            # 记录训练日志（记录主损失，不包含L2正则化）
             log_json = json.dumps(
-                {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}
+                {'global_step': global_step, 'loss': loss.item(), 'l2_loss': l2_loss.item() if l2_loss != 0 else 0, 'total_loss': total_loss.item(), 'epoch': epoch, 'time': time.time()}
             )
             log_file.write(log_json + '\n')
             log_file.flush()
